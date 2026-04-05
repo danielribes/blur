@@ -93,6 +93,15 @@ blur customers.csv -c "email:email" -s semicolon -p 10
 bash tests/run_tests.sh
 ```
 
+## Disclaimer
+
+This software is provided "as is", without warranty of any kind. Use it at your own risk.
+
+The author is not responsible for any data loss, privacy breaches, compliance failures,
+or any other damages arising from the use or misuse of this tool. It is your responsibility
+to verify that the output meets your anonymization requirements before using it in any
+sensitive or regulated context.
+
 ## License
 
 MIT
