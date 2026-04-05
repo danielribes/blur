@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+# blur — anonymize CSV files using SQLite3
+# https://github.com/danielribes/blur
+
+set -euo pipefail
+
+BLUR_VERSION="0.1.0"
+TEMP_DB=""
+CSV_SEPARATOR=","
+PREVIEW_ROWS=5
+
+# ---------------------------------------------------------------------------
+# Cleanup: remove temporary SQLite database on exit
+# ---------------------------------------------------------------------------
+cleanup() {
+    if [[ -n "$TEMP_DB" && -f "$TEMP_DB" ]]; then
+        rm -f "$TEMP_DB"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# die: print error to stderr and exit
+# ---------------------------------------------------------------------------
+die() {
+    echo "blur: error: $1" >&2
+    exit "${2:-1}"
+}
+
+# ---------------------------------------------------------------------------
+# usage: print help text
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+blur $BLUR_VERSION — anonymize CSV files
+
+Usage:
+  blur <file.csv> [options]
+
+Options:
+  -o <output>          Output file (default: <name>_blur.csv)
+  -c <col:method,...>  Non-interactive mode: specify columns and methods
+  -s <sep>             Force separator: comma, semicolon, tab (default: auto-detect)
+  -p <n>               Number of preview rows (default: 5)
+  -h, --help           Show this help
+
+Anonymization methods:
+  uuid   Replace with random 32-char hex string
+  email  Replace with <uuid>@anon.local
+  name   Replace with ANON_<sequential_number>
+  phone  Replace with random digit sequence of the same length
+
+Examples:
+  blur customers.csv
+  blur customers.csv -o anonymized.csv
+  blur customers.csv -c "email:email,full_name:name,phone:phone"
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# check_dependencies: verify sqlite3 is available on the system
+# ---------------------------------------------------------------------------
+check_dependencies() {
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        die "sqlite3 is required but not found. Install it via your package manager." 2
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# detect_separator: inspect the first line of a CSV to guess the delimiter.
+# Sets the global CSV_SEPARATOR variable. Supports , ; and tab.
+# ---------------------------------------------------------------------------
+detect_separator() {
+    local csv_file="$1"
+    local first_line
+    first_line=$(head -1 "$csv_file")
+
+    local comma_count semicolon_count tab_count
+    comma_count=$(printf '%s' "$first_line" | tr -cd ',' | wc -c | tr -d ' ')
+    semicolon_count=$(printf '%s' "$first_line" | tr -cd ';' | wc -c | tr -d ' ')
+    tab_count=$(printf '%s' "$first_line" | tr -cd '\t' | wc -c | tr -d ' ')
+
+    if [[ "$semicolon_count" -gt "$comma_count" && "$semicolon_count" -gt "$tab_count" ]]; then
+        CSV_SEPARATOR=";"
+    elif [[ "$tab_count" -gt "$comma_count" ]]; then
+        CSV_SEPARATOR=$(printf '\t')
+    else
+        CSV_SEPARATOR=","
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# import_csv: load CSV file into a temporary SQLite database.
+# Sets globals TEMP_DB and CSV_SEPARATOR.
+# Optional second argument overrides auto-detection.
+# ---------------------------------------------------------------------------
+import_csv() {
+    local csv_file="$1"
+    local override_separator="${2:-}"
+
+    if [[ -n "$override_separator" ]]; then
+        CSV_SEPARATOR="$override_separator"
+    else
+        detect_separator "$csv_file"
+    fi
+
+    TEMP_DB=$(mktemp /tmp/blur_XXXXXX.db)
+
+    {
+        printf '.separator "%s"\n' "$CSV_SEPARATOR"
+        printf '.import "%s" data\n' "$csv_file"
+    } | sqlite3 "$TEMP_DB" 2>/dev/null \
+        || die "Failed to import '$csv_file' into SQLite. Is it a valid CSV?"
+
+    local row_count
+    row_count=$(sqlite3 "$TEMP_DB" "SELECT count(*) FROM data;" 2>/dev/null) \
+        || die "Failed to read imported data." 2
+
+    if [[ "$row_count" -eq 0 ]]; then
+        die "File imported but contains no data rows."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# get_columns: print column names of the data table, one per line
+# ---------------------------------------------------------------------------
+get_columns() {
+    local db="$1"
+    sqlite3 "$db" "SELECT name FROM pragma_table_info('data');"
+}
+
+# ---------------------------------------------------------------------------
+# column_exists: return 0 if column name exists in the data table, 1 otherwise
+# ---------------------------------------------------------------------------
+column_exists() {
+    local db="$1"
+    local column_name="$2"
+    local found
+    found=$(sqlite3 "$db" "SELECT count(*) FROM pragma_table_info('data') WHERE name='$column_name';")
+    [[ "$found" -gt 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# show_data_preview: display column headers and first N rows
+# ---------------------------------------------------------------------------
+show_data_preview() {
+    local db="$1"
+    local limit="${2:-15}"
+    sqlite3 -column -header "$db" "SELECT * FROM data LIMIT $limit;"
+}
+
+# ---------------------------------------------------------------------------
+# anonymize_column: apply the chosen anonymization method to a column
+#   Methods: uuid, email, name, phone
+# ---------------------------------------------------------------------------
+anonymize_column() {
+    local db="$1"
+    local column="$2"
+    local method="$3"
+
+    case "$method" in
+        uuid)
+            sqlite3 "$db" "UPDATE data SET \"$column\" = lower(hex(randomblob(16)));"
+            ;;
+        email)
+            sqlite3 "$db" "UPDATE data SET \"$column\" = lower(hex(randomblob(16))) || '@anon.local';"
+            ;;
+        name)
+            # Sequential numbering using SQLite rowid guarantees uniqueness and order
+            sqlite3 "$db" "UPDATE data SET \"$column\" = 'ANON_' || rowid;"
+            ;;
+        phone)
+            # Build a random digit string at least as long as the original value,
+            # then truncate to the exact original character length.
+            # Two concatenated random integers cover up to ~38 digits.
+            sqlite3 "$db" "UPDATE data SET \"$column\" = substr(
+                cast(abs(random()) as text) || cast(abs(random()) as text) || '0000000000',
+                1,
+                length(\"$column\")
+            );"
+            ;;
+        *)
+            die "Unknown method '$method'. Valid methods: uuid, email, name, phone"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# export_csv: write the data table back to a CSV file with headers
+# ---------------------------------------------------------------------------
+export_csv() {
+    local db="$1"
+    local output_file="$2"
+
+    # Use the same separator as the input file
+    {
+        printf '.separator "%s"\n' "$CSV_SEPARATOR"
+        printf '.headers on\n'
+        printf '.output %s\n' "$output_file"
+        printf 'SELECT * FROM data;\n'
+        printf '.output stdout\n'
+    } | sqlite3 "$db" || die "Failed to export CSV to '$output_file'." 2
+}
+
+# ---------------------------------------------------------------------------
+# print_columns_menu: display numbered list of available columns
+# ---------------------------------------------------------------------------
+print_columns_menu() {
+    local db="$1"
+    local index=1
+    while IFS= read -r col_name; do
+        printf "  %2d  %s\n" "$index" "$col_name"
+        index=$((index + 1))
+    done < <(get_columns "$db")
+}
+
+# ---------------------------------------------------------------------------
+# interactive_mode: guide the user through column selection and export
+# ---------------------------------------------------------------------------
+interactive_mode() {
+    local db="$1"
+    local output_file="$2"
+    local preview_rows="${3:-5}"
+
+    # Load column names into a temp file, then into an indexed array.
+    # Using a temp file avoids process-substitution scoping issues in bash 3.2.
+    local col_tmp
+    col_tmp=$(mktemp /tmp/blur_cols_XXXXXX)
+    get_columns "$db" > "$col_tmp"
+
+    local columns=()
+    while IFS= read -r col_name; do
+        [[ -n "$col_name" ]] && columns+=("$col_name")
+    done < "$col_tmp"
+    rm -f "$col_tmp"
+
+    local col_count="${#columns[@]}"
+
+    echo ""
+    echo "Columns:"
+    print_columns_menu "$db"
+    echo ""
+    echo "Preview (first $preview_rows rows):"
+    show_data_preview "$db" "$preview_rows"
+
+    # Collect pending operations before applying any changes
+    local pending_cols=()
+    local pending_methods=()
+
+    echo ""
+    echo "Tip: enter one or more columns at once, with or without method:"
+    echo "  Single:    3"
+    echo "  Multiple:  2 5 9"
+    echo "  With method: 2:email 5:name 9:phone"
+
+    while true; do
+        echo ""
+        printf "Columns [1-%d], or 'done': " "$col_count"
+        read -r input_line
+
+        if [[ "$input_line" == "done" || "$input_line" == "q" || "$input_line" == "" ]]; then
+            break
+        fi
+
+        # Split input into tokens (space-separated)
+        local tokens=()
+        local old_ifs="$IFS"
+        IFS=' ' read -r -a tokens <<< "$input_line"
+        IFS="$old_ifs"
+
+        local token
+        for token in "${tokens[@]}"; do
+            # Accept both "3" and "3:method" formats
+            local num method
+            if [[ "$token" == *:* ]]; then
+                num="${token%%:*}"
+                method="${token##*:}"
+            else
+                num="$token"
+                method=""
+            fi
+
+            # Validate column number
+            if ! [[ "$num" =~ ^[0-9]+$ ]] || \
+               [[ "$num" -lt 1 ]] || \
+               [[ "$num" -gt "$col_count" ]]; then
+                echo "  Invalid column '$num'. Use a number between 1 and $col_count."
+                continue
+            fi
+
+            local selected_col="${columns[$((num - 1))]}"
+
+            # If method not provided inline, ask for it
+            if [[ -z "$method" ]]; then
+                printf "  Method for '%s' [uuid/email/name/phone]: " "$selected_col"
+                read -r method
+            fi
+
+            case "$method" in
+                uuid|email|name|phone)
+                    pending_cols+=("$selected_col")
+                    pending_methods+=("$method")
+                    echo "  + '$selected_col' → $method"
+                    ;;
+                *)
+                    echo "  Unknown method '$method'. Choose: uuid, email, name, phone"
+                    ;;
+            esac
+        done
+    done
+
+    if [[ "${#pending_cols[@]}" -eq 0 ]]; then
+        echo ""
+        echo "No columns selected. Nothing to do."
+        exit 0
+    fi
+
+    # Apply all operations
+    echo ""
+    echo "Applying anonymization..."
+    local i=0
+    while [[ "$i" -lt "${#pending_cols[@]}" ]]; do
+        anonymize_column "$db" "${pending_cols[$i]}" "${pending_methods[$i]}"
+        echo "  done  ${pending_cols[$i]} → ${pending_methods[$i]}"
+        i=$((i + 1))
+    done
+
+    # Preview anonymized result before writing output
+    echo ""
+    echo "Preview of anonymized data (first 5 rows):"
+    show_data_preview "$db" 5
+
+    echo ""
+    printf "Export to '%s'? [Y/n]: " "$output_file"
+    read -r confirm
+
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+        echo "Export cancelled."
+        exit 0
+    fi
+
+    export_csv "$db" "$output_file"
+
+    local row_count
+    row_count=$(sqlite3 "$db" "SELECT count(*) FROM data;")
+    echo "Done. $row_count rows written to '$output_file'."
+}
+
+# ---------------------------------------------------------------------------
+# batch_mode: apply column:method pairs without user interaction
+# Expects columns_spec in the form "col1:method1,col2:method2"
+# ---------------------------------------------------------------------------
+batch_mode() {
+    local db="$1"
+    local output_file="$2"
+    local columns_spec="$3"
+
+    # Split on commas to get individual col:method pairs
+    local old_ifs="$IFS"
+    IFS=',' read -r -a ops <<< "$columns_spec"
+    IFS="$old_ifs"
+
+    for op in "${ops[@]}"; do
+        local col="${op%%:*}"
+        local method="${op##*:}"
+
+        if [[ -z "$col" || -z "$method" || "$col" == "$op" ]]; then
+            die "Invalid column spec: '$op'. Expected format: column:method"
+        fi
+
+        if ! column_exists "$db" "$col"; then
+            die "Column '$col' not found in the CSV."
+        fi
+
+        anonymize_column "$db" "$col" "$method"
+        echo "  done  $col → $method"
+    done
+
+    export_csv "$db" "$output_file"
+
+    local row_count
+    row_count=$(sqlite3 "$db" "SELECT count(*) FROM data;")
+    echo "Done. $row_count rows written to '$output_file'."
+}
+
+# ---------------------------------------------------------------------------
+# main: entry point — parse arguments and dispatch to the right mode
+# ---------------------------------------------------------------------------
+main() {
+    check_dependencies
+
+    local csv_file=""
+    local output_file=""
+    local columns_spec=""
+    local forced_separator=""
+    local preview_rows="$PREVIEW_ROWS"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -o)
+                [[ $# -lt 2 ]] && die "Option -o requires an argument."
+                shift
+                output_file="$1"
+                ;;
+            -c)
+                [[ $# -lt 2 ]] && die "Option -c requires an argument."
+                shift
+                columns_spec="$1"
+                ;;
+            -p)
+                [[ $# -lt 2 ]] && die "Option -p requires an argument."
+                shift
+                [[ "$1" =~ ^[0-9]+$ ]] || die "Option -p requires a positive integer."
+                preview_rows="$1"
+                ;;
+            -s)
+                [[ $# -lt 2 ]] && die "Option -s requires an argument."
+                shift
+                if [[ "$1" == "comma" || "$1" == "," ]]; then
+                    forced_separator=","
+                elif [[ "$1" == "semicolon" || "$1" == ";" ]]; then
+                    forced_separator=";"
+                elif [[ "$1" == "tab" || "$1" == $'\t' ]]; then
+                    forced_separator=$(printf '\t')
+                else
+                    die "Unknown separator '$1'. Use: comma, semicolon, tab"
+                fi
+                ;;
+            -*)
+                die "Unknown option: $1. Run 'blur --help' for usage."
+                ;;
+            *)
+                [[ -n "$csv_file" ]] && die "Only one input file is allowed."
+                csv_file="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [[ -z "$csv_file" ]]; then
+        usage
+        exit 1
+    fi
+
+    if [[ ! -f "$csv_file" ]]; then
+        die "File not found: $csv_file"
+    fi
+
+    if [[ ! -r "$csv_file" ]]; then
+        die "File is not readable: $csv_file"
+    fi
+
+    # Default output path: same directory, _blur suffix
+    if [[ -z "$output_file" ]]; then
+        local base="${csv_file%.csv}"
+        output_file="${base}_blur.csv"
+    fi
+
+    echo "blur $BLUR_VERSION"
+    echo "Input:  $csv_file"
+    echo "Output: $output_file"
+
+    printf "Importing CSV... "
+    import_csv "$csv_file" "$forced_separator"
+    echo "ok (separator: '$CSV_SEPARATOR')"
+
+    if [[ -n "$columns_spec" ]]; then
+        batch_mode "$TEMP_DB" "$output_file" "$columns_spec"
+    else
+        interactive_mode "$TEMP_DB" "$output_file" "$preview_rows"
+    fi
+}
+
+main "$@"

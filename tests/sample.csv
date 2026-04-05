@@ -1,0 +1,9 @@
+id,full_name,email,phone,address,amount
+1,Joan Smith,joan.smith@company.com,+34 612 345 678,"Carrer Major, 12",1200.50
+2,Maria García,maria.garcia@company.com,+34 698 765 432,"Avinguda del Paral·lel, 45",340.00
+3,Pau Fernández,pau.fernandez@company.com,+34 655 111 222,"Carrer de la Llibertat, 3",89.99
+4,Anna López,anna.lopez@company.com,+34 677 333 444,"Plaça de Catalunya, 1",4500.00
+5,Marc Puig,marc.puig@company.com,+34 611 999 888,"Carrer Nou de la Rambla, 77",230.75
+6,"O'Brien, Patrick",patrick.obrien@company.com,+34 633 777 555,"Gran Via, 200",99.00
+7,Laia Torres,laia.torres@company.com,+34 644 222 111,"Carrer d'Aragó, 55",1800.00
+8,Jordi Mas,jordi.mas@company.com,+34 699 444 666,"Rambla de Catalunya, 88",560.25
