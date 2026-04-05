@@ -1,6 +1,6 @@
 # blur
 
-A CLI tool to anonymize CSV files. Zero external dependencies — just Bash and SQLite3.
+A CLI tool to anonymize CSV files. Zero external dependencies, just Bash and SQLite3.
 
 ## Why
 
